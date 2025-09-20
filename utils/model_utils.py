@@ -119,6 +119,12 @@ def demix(
                 # Process batch if it's full or the end is reached
                 if len(batch_data) >= batch_size or i >= mix.shape[1]:
                     arr = torch.stack(batch_data, dim=0)
+                    # Mark cudagraph step begin to avoid output overwrite across runs under torch.compile
+                    if hasattr(torch.compiler, 'cudagraph_mark_step_begin'):
+                        try:
+                            torch.compiler.cudagraph_mark_step_begin()
+                        except Exception:
+                            pass
                     x = model(arr)
 
                     if mode == "generic":

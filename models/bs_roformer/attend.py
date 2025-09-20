@@ -84,13 +84,11 @@ class Attend(nn.Module):
 
         config = self.cuda_config if is_cuda else self.cpu_config
 
-        # pytorch 2.0 flash attn: q, k, v, mask, dropout, softmax_scale
-
-        with torch.backends.cuda.sdp_kernel(**config._asdict()):
-            out = F.scaled_dot_product_attention(
-                q, k, v,
-                dropout_p = self.dropout if self.training else 0.
-            )
+        # Directly call SDPA. Let PyTorch pick the best kernel; avoid context managers inside compiled graphs.
+        out = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p = self.dropout if self.training else 0.
+        )
 
         return out
 

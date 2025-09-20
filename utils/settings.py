@@ -194,6 +194,20 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
                         help="Flag adds test time augmentation during inference (polarity and channel inverse)."
                         "While this triples the runtime, it reduces noise and slightly improves prediction quality.")
     parser.add_argument("--lora_checkpoint", type=str, default='', help="Initial checkpoint to LoRA weights")
+    # torch.compile options for inference acceleration
+    parser.add_argument("--torch_compile", action='store_true', help="Enable torch.compile for inference")
+    parser.add_argument("--compile_backend", type=str, default='inductor', help="torch.compile backend (default: inductor)")
+    parser.add_argument("--compile_mode", type=str, default='max-autotune', choices=['default', 'reduce-overhead', 'max-autotune'], help="torch.compile mode")
+    parser.add_argument("--compile_fullgraph", action='store_true', help="Use fullgraph=True in torch.compile")
+    parser.add_argument("--compile_dynamic", action='store_true', help="Enable dynamic shapes in torch.compile")
+    # fast I/O and resample controls
+    parser.add_argument("--prefer_torchaudio_io", action='store_true', help="Prefer torchaudio for loading/resample")
+    parser.add_argument("--resample_on_gpu", action='store_true', help="Resample on GPU if available (torchaudio)")
+    parser.add_argument("--librosa_res_type", type=str, default='kaiser_fast', help="librosa.resample quality (e.g., kaiser_fast/soxr_mq)")
+    parser.add_argument("--use_torchaudio_save", action='store_true', help="Use torchaudio.save for writing WAV")
+    # async writing
+    parser.add_argument("--async_write", action='store_true', help="Enable async disk writing for outputs")
+    parser.add_argument("--async_workers", type=int, default=2, help="Number of async writer threads")
 
     if dict_args is not None:
         args = parser.parse_args([])
