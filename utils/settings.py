@@ -212,6 +212,15 @@ def parse_args_inference(dict_args: Union[Dict, None]) -> argparse.Namespace:
     parser.add_argument("--filename_template", type=str, default='{file_name}/{instr}',
                         help="Output filename template, without extension, using '/' for subdirectories. Default: '{file_name}/{instr}'")
     parser.add_argument("--lora_checkpoint_loralib", type=str, default='', help="Initial checkpoint to LoRA weights")
+
+    # torch.compile related options (PyTorch 2+)
+    parser.add_argument("--torch_compile", action='store_true', help="Enable torch.compile for inference (PyTorch 2+)")
+    parser.add_argument("--compile_backend", type=str, default="inductor", help="torch.compile backend (default: inductor)")
+    parser.add_argument("--compile_mode", type=str, default="reduce-overhead",
+                        choices=["default", "reduce-overhead", "max-autotune", "max-autotune-no-cudagraphs"], help="torch.compile mode")
+    parser.add_argument("--compile_dynamic", action='store_true', help="Enable dynamic shape support for torch.compile")
+    parser.add_argument("--compile_fullgraph", action='store_true', help="Force fullgraph=True to reduce graph breaks")
+
     if dict_args is not None:
         args = parser.parse_args([])
         args_dict = vars(args)

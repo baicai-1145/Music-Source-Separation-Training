@@ -13,7 +13,6 @@ from torch.optim import Adam, AdamW, SGD, RAdam, RMSprop
 from tqdm.auto import tqdm
 from typing import Dict, List, Tuple, Any, Union, Optional
 import loralib as lora
-from .muon import Muon as Muon, AdaGO as AdaGO
 import torch.distributed as dist
 
 def demix(
@@ -52,7 +51,26 @@ def demix(
 
     should_print = not dist.is_initialized() or dist.get_rank() == 0
 
-    mix = torch.tensor(mix, dtype=torch.float32)
+    # Efficient host tensor creation for H2D copy:
+    # - avoid extra copy by using from_numpy (mix comes as np.float32 from torchaudio)
+    # - pin memory when copying to CUDA to enable non_blocking H2D
+    is_cuda = False
+    try:
+        dev_str = str(device) if not isinstance(device, torch.device) else device.type
+        is_cuda = "cuda" in dev_str
+    except Exception:
+        is_cuda = False
+
+    mix = torch.from_numpy(mix).contiguous()
+    if is_cuda and not mix.is_pinned():
+        try:
+            mix = mix.pin_memory()
+        except Exception:
+            pass
+    # Log once: H2D pipeline details
+    if is_cuda and not getattr(demix, "_logged_h2d", False):
+        print(f"[IO] H2D: pin_memory={mix.is_pinned()}, non_blocking_copy=True (CUDA)")
+        demix._logged_h2d = True
 
     if model_type == 'htdemucs':
         mode = 'demucs'
@@ -80,6 +98,13 @@ def demix(
         # Add padding for generic mode to handle edge artifacts
         if length_init > 2 * border and border > 0:
             mix = nn.functional.pad(mix, (border, border), mode="reflect")
+    # Log once: windowing/shape config
+    if not getattr(demix, "_logged_cfg", False):
+        try:
+            print(f"[Config] mode={mode}, chunk_size={chunk_size}, batch_size={config.inference.batch_size}, num_overlap={num_overlap}, fade={fade_size if mode=='generic' else 0}")
+        except Exception:
+            pass
+        demix._logged_cfg = True
 
     batch_size = config.inference.batch_size
 
@@ -104,13 +129,14 @@ def demix(
 
             while i < mix.shape[1]:
                 # Extract chunk and apply padding if necessary
-                part = mix[:, i:i + chunk_size].to(device)
+                part = mix[:, i:i + chunk_size]
                 chunk_len = part.shape[-1]
                 if mode == "generic" and chunk_len > chunk_size // 2:
                     pad_mode = "reflect"
                 else:
                     pad_mode = "constant"
                 part = nn.functional.pad(part, (0, chunk_size - chunk_len), mode=pad_mode, value=0)
+                part = part.to(device, non_blocking=is_cuda)
 
                 batch_data.append(part)
                 batch_locations.append((i, chunk_len))
@@ -119,7 +145,21 @@ def demix(
                 # Process batch if it's full or the end is reached
                 if len(batch_data) >= batch_size or i >= mix.shape[1]:
                     arr = torch.stack(batch_data, dim=0)
-                    x = model(arr)
+                    # Mark step for CUDA Graphs to avoid overwritten outputs across runs
+                    try:
+                        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+                            torch.compiler.cudagraph_mark_step_begin()
+                    except Exception:
+                        pass
+                    # Use fast SDPA kernels on CUDA-enabled systems
+                    if is_cuda and hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "sdp_kernel"):
+                        if not getattr(demix, "_logged_sdpa", False):
+                            print("[Attention] 使用 SDPA 快内核: flash=True, mem_efficient=True, math=True (允许回退)")
+                            demix._logged_sdpa = True
+                        with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_mem_efficient=True, enable_math=True):
+                            x = model(arr)
+                    else:
+                        x = model(arr)
 
                     if mode == "generic":
                         window = windowing_array.clone() # using clone() fixes the clicks at chunk edges when using batch_size=1
@@ -272,6 +312,14 @@ def get_optimizer(config: ConfigDict, model: torch.nn.Module) -> torch.optim.Opt
             print(f"Muon group params: {muon_group_config}")
             print(f"Adam group params: {adam_group_config}")
 
+        # Lazy import to avoid inference-time hard dependency
+        try:
+            from .muon import Muon as Muon
+        except Exception as e:
+            raise SystemExit("Muon optimizer requested but optional dependency is missing. "
+                             "Please ensure 'pytorch_optimizer' is installed or avoid using 'muon' optimizer "
+                             "for inference-only runs.") from e
+
         param_groups = [
             dict(params=muon_params, use_muon=True,  **muon_group_config),
             dict(params=adam_params, use_muon=False, **adam_group_config),
@@ -295,6 +343,14 @@ def get_optimizer(config: ConfigDict, model: torch.nn.Module) -> torch.optim.Opt
         if should_print:
             print(f"AdaGO muon group params: {muon_group_config}")
             print(f"AdaGO adam group params: {adam_group_config}")
+
+        # Lazy import to avoid inference-time hard dependency
+        try:
+            from .muon import AdaGO as AdaGO
+        except Exception as e:
+            raise SystemExit("AdaGO optimizer requested but optional dependency is missing. "
+                             "Please ensure 'pytorch_optimizer' is installed or avoid using 'adago' optimizer "
+                             "for inference-only runs.") from e
 
         param_groups = [
             dict(params=muon_params, use_muon=True,  **muon_group_config),
