@@ -1,4 +1,5 @@
 from functools import partial
+from collections.abc import Mapping as MappingABC
 
 import torch
 from torch import nn, einsum, tensor, Tensor
@@ -12,7 +13,7 @@ except:
     pass
 from torch.utils.checkpoint import checkpoint
 
-from beartype.typing import Tuple, Optional, List, Callable
+from beartype.typing import Tuple, Optional, List, Callable, Any
 from beartype import beartype
 
 from rotary_embedding_torch import RotaryEmbedding
@@ -21,6 +22,8 @@ from einops import rearrange, pack, unpack, reduce, repeat
 from einops.layers.torch import Rearrange
 
 from librosa import filters
+
+from models.moe import SparseMoEFeedForward
 
 
 # helper functions
@@ -70,21 +73,54 @@ class FeedForward(Module):
             self,
             dim,
             mult=4,
-            dropout=0.
+            dropout=0.,
+            use_moe=False,
+            moe_kwargs: Optional[dict] = None,
+            registry: Optional[List['FeedForward']] = None,
     ):
         super().__init__()
         dim_inner = int(dim * mult)
-        self.net = nn.Sequential(
-            RMSNorm(dim),
-            nn.Linear(dim, dim_inner),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim_inner, dim),
-            nn.Dropout(dropout)
-        )
+        self.norm = RMSNorm(dim)
+        self.use_moe = use_moe
+        self._latest_aux_loss: Optional[Tensor] = None
+        moe_kwargs = moe_kwargs or {}
+        if use_moe:
+            hidden_dim = moe_kwargs.get('hidden_dim', dim_inner)
+            self.moe = SparseMoEFeedForward(
+                dim=dim,
+                hidden_dim=hidden_dim,
+                num_experts=moe_kwargs.get('num_experts', 32),
+                top_k=moe_kwargs.get('top_k', 2),
+                dropout=dropout,
+                aux_loss_weight=moe_kwargs.get('aux_loss_weight', 0.01),
+                capacity_factor=moe_kwargs.get('capacity_factor', 1.1),
+            )
+            self.net = None
+            if registry is not None:
+                registry.append(self)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(dim, dim_inner),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(dim_inner, dim),
+                nn.Dropout(dropout)
+            )
+            self.moe = None
 
     def forward(self, x):
-        return self.net(x)
+        x = self.norm(x)
+        if not self.use_moe:
+            return self.net(x)
+
+        out, aux_loss = self.moe(x)
+        self._latest_aux_loss = aux_loss
+        return out
+
+    def pop_aux_loss(self):
+        loss = self._latest_aux_loss
+        self._latest_aux_loss = None
+        return loss
 
 
 class Attention(Module):
@@ -215,9 +251,14 @@ class Transformer(Module):
             flash_attn=True,
             linear_attn=False,
             sage_attention=False,
+            use_moe_ff=False,
+            moe_kwargs: Optional[dict] = None,
+            moe_registry: Optional[List[FeedForward]] = None,
     ):
         super().__init__()
         self.layers = ModuleList([])
+        self.use_moe_ff = use_moe_ff
+        self.moe_kwargs = moe_kwargs or {}
 
         for _ in range(depth):
             if linear_attn:
@@ -242,7 +283,14 @@ class Transformer(Module):
 
             self.layers.append(ModuleList([
                 attn,
-                FeedForward(dim=dim, mult=ff_mult, dropout=ff_dropout)
+                FeedForward(
+                    dim=dim,
+                    mult=ff_mult,
+                    dropout=ff_dropout,
+                    use_moe=use_moe_ff,
+                    moe_kwargs=self.moe_kwargs,
+                    registry=moe_registry,
+                )
             ]))
 
         self.norm = RMSNorm(dim) if norm_output else nn.Identity()
@@ -390,6 +438,7 @@ class MelBandRoformer(Module):
             use_torch_checkpoint=False,
             skip_connection=False,
             sage_attention=False,
+            moe: Optional[Any] = None,
     ):
         super().__init__()
 
@@ -400,6 +449,21 @@ class MelBandRoformer(Module):
         self.skip_connection = skip_connection
 
         self.layers = ModuleList([])
+
+        if moe is None:
+            moe = {}
+        elif isinstance(moe, MappingABC):
+            moe = dict(moe)
+
+        self.use_moe_ff = bool(moe.get('enabled', False))
+        self.moe_layers: List[FeedForward] = []
+        self.moe_ffn_config = {
+            'num_experts': moe.get('num_experts', 32),
+            'top_k': moe.get('top_k', 2),
+            'aux_loss_weight': moe.get('aux_loss_weight', 0.01),
+            'capacity_factor': moe.get('capacity_factor', 1.1),
+            'hidden_dim': int(dim * moe.get('hidden_mult', mlp_expansion_factor)),
+        }
 
         if sage_attention:
             print("Use Sage Attention")
@@ -412,6 +476,9 @@ class MelBandRoformer(Module):
             ff_dropout=ff_dropout,
             flash_attn=flash_attn,
             sage_attention=sage_attention,
+            use_moe_ff=self.use_moe_ff,
+            moe_kwargs=self.moe_ffn_config,
+            moe_registry=self.moe_layers,
         )
 
         time_rotary_embed = RotaryEmbedding(dim=dim_head)
@@ -705,6 +772,13 @@ class MelBandRoformer(Module):
         weighted_multi_resolution_loss = multi_stft_resolution_loss * self.multi_stft_resolution_loss_weight
 
         total_loss = loss + weighted_multi_resolution_loss
+
+        if exists(target) and self.use_moe_ff:
+            aux_terms = [layer.pop_aux_loss() for layer in self.moe_layers]
+            aux_terms = [term for term in aux_terms if term is not None]
+            if len(aux_terms) > 0:
+                moe_aux = torch.stack(aux_terms).sum()
+                total_loss = total_loss + moe_aux
 
         if not return_loss_breakdown:
             return total_loss

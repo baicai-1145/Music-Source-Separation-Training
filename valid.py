@@ -239,6 +239,12 @@ def process_audio_files(
         }
 
     # --- tqdm wrapping as requested ---
+    max_tracks = getattr(config.training, 'max_valid_tracks', None)
+    if max_tracks is None and hasattr(config, 'inference'):
+        max_tracks = getattr(config.inference, 'max_valid_tracks', None)
+    if max_tracks is not None:
+        mixture_paths = mixture_paths[:max_tracks]
+
     if is_tqdm and should_print:
         mixture_paths = tqdm(mixture_paths)
 
@@ -334,7 +340,7 @@ def process_audio_files(
                     all_metrics,
                     instr,
                     pbar_dict,
-                    mixture_paths=mixture_paths,
+                    mixture_paths=mixture_paths if isinstance(mixture_paths, tqdm) else None,
                     verbose=verbose and should_print,
                     path=path
                 )
@@ -345,7 +351,7 @@ def process_audio_files(
                     all_metrics,
                     instr,
                     pbar_dict,
-                    mixture_paths=mixture_paths,
+                    mixture_paths=mixture_paths if isinstance(mixture_paths, tqdm) else None,
                     verbose=verbose and should_print
                 )
 

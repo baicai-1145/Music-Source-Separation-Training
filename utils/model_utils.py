@@ -61,7 +61,7 @@ def demix(
     except Exception:
         is_cuda = False
 
-    mix = torch.from_numpy(mix).contiguous()
+    mix = torch.from_numpy(mix).to(torch.float32).contiguous()
     if is_cuda and not mix.is_pinned():
         try:
             mix = mix.pin_memory()
